@@ -1,50 +1,30 @@
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import requests
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+import json
 
-# Load .env variables if running locally
-load_dotenv()
+AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN") or "patD44eAmwBtOGZ4l.c24106c64563ac416643f50718f4a702859fcec80734cc8b2f4825e814f4648e"
+
+with open("bases.json") as f:
+    DATA_SOURCES = json.load(f)
 
 app = FastAPI()
 
-# Allow all origins during development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
 
-# ✅ Your actual Airtable token (with fallback for local dev)
-AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN") or "patD44eAmwBtOGZ4l.c24106c64563ac416643f50718f4a702859fcec80734cc8b2f4825e814f4648e"
-
-# ✅ Mapping of base + table by name
-DATA_SOURCES = {
-    "ivy": {
-        "base_id": "appcICyZQ3zPn2jyu",
-        "table": "Ivy Sathorn 10"
-    },
-    "master": {
-        "base_id": "appoCDPIuhneJ0vwm",
-        "table": "Master Condo List"
-    }
-}
-
-# ✅ Endpoint to fetch all records from a given source
-@app.get("/records/{source}")
-async def get_all_records(source: str):
+@app.get("/qu/{source}")
+async def get_filtered_records(source: str, request: Request):
     if source not in DATA_SOURCES:
         raise HTTPException(status_code=404, detail="Source not found")
 
     base_id = DATA_SOURCES[source]["base_id"]
     table_name = DATA_SOURCES[source]["table"]
     url = f"https://api.airtable.com/v0/{base_id}/{table_name}"
-    headers = {
-        "Authorization": f"Bearer {AIRTABLE_TOKEN}"
-    }
+    headers = { "Authorization": f"Bearer {AIRTABLE_TOKEN}" }
 
     all_records = []
     params = {}
@@ -56,10 +36,48 @@ async def get_all_records(source: str):
 
         data = response.json()
         all_records.extend(data.get("records", []))
-
         if "offset" in data:
             params["offset"] = data["offset"]
         else:
             break
 
-    return {"source": source, "records": all_records}
+    # Parse filters like RENT_lte=15000 or FL_gt=10
+    filters = {}
+    for key, value in request.query_params.items():
+        if "_" not in key:
+            continue
+        field, op = key.rsplit("_", 1)
+        filters.setdefault(field, []).append((op, value))
+
+    def passes_filters(fields):
+        for field, conditions in filters.items():
+            if field not in fields:
+                return False
+            raw_value = fields[field]
+
+            for op, value in conditions:
+                try:
+                    # Convert both to numbers if possible
+                    val_num = float(str(value).replace(",", ""))
+                    raw_num = float(str(raw_value).replace(",", ""))
+                except:
+                    val_num = value.strip().lower()
+                    raw_num = str(raw_value).strip().lower()
+
+                if op == "eq" and raw_num != val_num:
+                    return False
+                elif op == "neq" and raw_num == val_num:
+                    return False
+                elif op == "gt" and raw_num <= val_num:
+                    return False
+                elif op == "gte" and raw_num < val_num:
+                    return False
+                elif op == "lt" and raw_num >= val_num:
+                    return False
+                elif op == "lte" and raw_num > val_num:
+                    return False
+        return True
+
+    filtered_records = [rec for rec in all_records if passes_filters(rec.get("fields", {}))]
+
+    return { "source": source, "records": filtered_records }
