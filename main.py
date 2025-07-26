@@ -1,7 +1,7 @@
 import os
 import json
 import difflib
-from typing import Dict, Any
+from typing import Dict
 import requests
 from fastapi import FastAPI, HTTPException, Query, Path
 from fastapi.responses import JSONResponse
@@ -12,7 +12,7 @@ AIRTABLE_URL = "https://api.airtable.com/v0"
 
 app = FastAPI()
 
-# Enable CORS (for Render + Custom GPT)
+# CORS for Render + Custom GPT access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,23 +20,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load config from external JSON
+# Load base mappings
 with open("bases.json", "r") as f:
     BASES = json.load(f)
 
-# Fuzzy match source
+# Match user input to closest base
 def get_closest_source_key(requested_key: str, valid_keys: list) -> str:
     matches = difflib.get_close_matches(requested_key.lower(), valid_keys, n=1, cutoff=0.8)
     return matches[0] if matches else None
 
-# Main endpoint
+# Main route for Airtable query
 @app.get("/qu/{source}")
 def query_airtable(
     source: str = Path(..., description="The source name from bases.json"),
     offset: str = Query(None),
-    **filters: str
+    **filters: str  # <- dynamic query filtering
 ):
-    # Match source name
+    # Match source
     valid_keys = list(BASES.keys())
     matched_key = get_closest_source_key(source, valid_keys)
     if not matched_key:
@@ -44,11 +44,11 @@ def query_airtable(
             status_code=400,
             content={"error": f"Unknown source '{source}'. Available: {valid_keys}"},
         )
-    
+
     base_id = BASES[matched_key]["base_id"]
     table_name = BASES[matched_key]["table"]
 
-    # Build Airtable filter formula
+    # Convert query params into Airtable formula
     conditions = []
     for key, val in filters.items():
         if key.endswith("_lte"):
@@ -68,7 +68,7 @@ def query_airtable(
             conditions.append(f"NOT({{{field}}} = '{val}')")
         else:
             conditions.append(f"{{{key}}} = '{val}'")
-    
+
     formula = f"AND({','.join(conditions)})" if conditions else None
 
     headers = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
