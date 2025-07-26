@@ -1,9 +1,9 @@
 import os
 import json
 import difflib
-from typing import Dict
+from typing import Optional, Dict, Any
 import requests
-from fastapi import FastAPI, HTTPException, Query, Path
+from fastapi import FastAPI, Query, Path
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -24,19 +24,40 @@ app.add_middleware(
 with open("bases.json", "r") as f:
     BASES = json.load(f)
 
-# Match user input to closest base
-def get_closest_source_key(requested_key: str, valid_keys: list) -> str:
+# Fuzzy match base name
+def get_closest_source_key(requested_key: str, valid_keys: list) -> Optional[str]:
     matches = difflib.get_close_matches(requested_key.lower(), valid_keys, n=1, cutoff=0.8)
     return matches[0] if matches else None
 
-# Main route for Airtable query
+# Helper: build Airtable filter formula from query params
+def build_formula(filters: Dict[str, str]) -> Optional[str]:
+    conditions = []
+    for key, val in filters.items():
+        if key.endswith("_lte"):
+            field = key[:-4]
+            conditions.append(f"{{{field}}} <= {val}")
+        elif key.endswith("_gte"):
+            field = key[:-4]
+            conditions.append(f"{{{field}}} >= {val}")
+        elif key.endswith("_lt"):
+            field = key[:-3]
+            conditions.append(f"{{{field}}} < {val}")
+        elif key.endswith("_gt"):
+            field = key[:-3]
+            conditions.append(f"{{{field}}} > {val}")
+        elif key.endswith("_ne"):
+            field = key[:-3]
+            conditions.append(f"NOT({{{field}}} = '{val}')")
+        else:
+            conditions.append(f"{{{key}}} = '{val}'")
+    return f"AND({','.join(conditions)})" if conditions else None
+
 @app.get("/qu/{source}")
 def query_airtable(
     source: str = Path(..., description="The source name from bases.json"),
-    offset: str = Query(None),
+    offset: Optional[str] = Query(None),
     **query_params: str
 ):
-    # Match source
     valid_keys = list(BASES.keys())
     matched_key = get_closest_source_key(source, valid_keys)
     if not matched_key:
@@ -48,29 +69,7 @@ def query_airtable(
     base_id = BASES[matched_key]["base_id"]
     table_name = BASES[matched_key]["table"]
 
-    # Convert query params into Airtable formula
-    conditions = []
-    for key, val in query_params.items():
-        if key.endswith("_lte"):
-            field = key[:-4]
-            conditions.append(f"AND(NOT({{{field}}} = BLANK()), {{{field}}} <= {val})")
-        elif key.endswith("_gte"):
-            field = key[:-4]
-            conditions.append(f"AND(NOT({{{field}}} = BLANK()), {{{field}}} >= {val})")
-        elif key.endswith("_lt"):
-            field = key[:-3]
-            conditions.append(f"AND(NOT({{{field}}} = BLANK()), {{{field}}} < {val})")
-        elif key.endswith("_gt"):
-            field = key[:-3]
-            conditions.append(f"AND(NOT({{{field}}} = BLANK()), {{{field}}} > {val})")
-        elif key.endswith("_ne"):
-            field = key[:-3]
-            conditions.append(f"AND(NOT({{{field}}} = BLANK()), NOT({{{field}}} = '{val}'))")
-        else:
-            conditions.append(f"AND(NOT({{{key}}} = BLANK()), {{{key}}} = '{val}')")
-
-    formula = f"AND({','.join(conditions)})" if conditions else None
-
+    formula = build_formula(query_params)
     headers = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
     params = {"filterByFormula": formula} if formula else {}
     if offset:
