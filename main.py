@@ -1,9 +1,9 @@
 import os
 import json
 import difflib
-from typing import Optional, Dict, Any
+from typing import Dict
 import requests
-from fastapi import FastAPI, Request, Query, Path
+from fastapi import FastAPI, HTTPException, Query, Path
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,7 +12,7 @@ AIRTABLE_URL = "https://api.airtable.com/v0"
 
 app = FastAPI()
 
-# CORS for Render + Custom GPT access
+# Enable CORS for Custom GPT & external access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,44 +20,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load base mappings
+# Load base config
 with open("bases.json", "r") as f:
     BASES = json.load(f)
 
-# Fuzzy match base name
-def get_closest_source_key(requested_key: str, valid_keys: list) -> Optional[str]:
+def get_closest_source_key(requested_key: str, valid_keys: list) -> str:
     matches = difflib.get_close_matches(requested_key.lower(), valid_keys, n=1, cutoff=0.8)
     return matches[0] if matches else None
 
-# Build Airtable formula
-def build_formula(filters: Dict[str, str]) -> Optional[str]:
-    conditions = []
-    for key, val in filters.items():
-        if key.endswith("_lte"):
-            field = key[:-4]
-            conditions.append(f"{{{field}}} <= {val}")
-        elif key.endswith("_gte"):
-            field = key[:-4]
-            conditions.append(f"{{{field}}} >= {val}")
-        elif key.endswith("_lt"):
-            field = key[:-3]
-            conditions.append(f"{{{field}}} < {val}")
-        elif key.endswith("_gt"):
-            field = key[:-3]
-            conditions.append(f"{{{field}}} > {val}")
-        elif key.endswith("_ne"):
-            field = key[:-3]
-            conditions.append(f"NOT({{{field}}} = '{val}')")
-        else:
-            conditions.append(f"{{{key}}} = '{val}'")
-    return f"AND({','.join(conditions)})" if conditions else None
+def cast_numeric(value):
+    try:
+        return float(str(value).replace(",", ""))
+    except:
+        return None
 
-# Main route — read filters dynamically from raw request
+def check_condition(field_val, op, compare_val):
+    num_val = cast_numeric(field_val)
+    num_cmp = cast_numeric(compare_val)
+    if num_val is None or num_cmp is None:
+        return False
+    if op == "lt": return num_val < num_cmp
+    if op == "lte": return num_val <= num_cmp
+    if op == "gt": return num_val > num_cmp
+    if op == "gte": return num_val >= num_cmp
+    return False
+
 @app.get("/qu/{source}")
-async def query_airtable(
-    request: Request,
+def query_airtable(
     source: str = Path(..., description="The source name from bases.json"),
-    offset: Optional[str] = Query(None)
+    offset: str = Query(None),
+    **query_params: str
 ):
     valid_keys = list(BASES.keys())
     matched_key = get_closest_source_key(source, valid_keys)
@@ -70,28 +62,67 @@ async def query_airtable(
     base_id = BASES[matched_key]["base_id"]
     table_name = BASES[matched_key]["table"]
 
-    # Parse filters from raw query
-    raw_query: Dict[str, Any] = dict(request.query_params)
-    raw_query.pop("offset", None)
-
-    formula = build_formula(raw_query)
     headers = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
-    params = {"filterByFormula": formula} if formula else {}
+    url = f"{AIRTABLE_URL}/{base_id}/{table_name}"
+
+    # Get all records (handle pagination)
+    all_records = []
+    params = {}
     if offset:
         params["offset"] = offset
+    while True:
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            return JSONResponse(
+                status_code=response.status_code,
+                content={"error": "Failed to fetch from Airtable", "details": response.text},
+            )
+        data = response.json()
+        all_records.extend(data.get("records", []))
+        if "offset" not in data:
+            break
+        params["offset"] = data["offset"]
 
-    url = f"{AIRTABLE_URL}/{base_id}/{table_name}"
-    response = requests.get(url, headers=headers, params=params)
+    # Apply filters manually
+    filtered = []
+    for record in all_records:
+        fields = record.get("fields", {})
+        match = True
+        for key, val in query_params.items():
+            if key.endswith("_lt"):
+                field = key[:-3]
+                if not check_condition(fields.get(field), "lt", val):
+                    match = False
+                    break
+            elif key.endswith("_lte"):
+                field = key[:-4]
+                if not check_condition(fields.get(field), "lte", val):
+                    match = False
+                    break
+            elif key.endswith("_gt"):
+                field = key[:-3]
+                if not check_condition(fields.get(field), "gt", val):
+                    match = False
+                    break
+            elif key.endswith("_gte"):
+                field = key[:-4]
+                if not check_condition(fields.get(field), "gte", val):
+                    match = False
+                    break
+            elif key.endswith("_ne"):
+                field = key[:-3]
+                if str(fields.get(field)).strip() == val:
+                    match = False
+                    break
+            else:
+                if str(fields.get(key)).strip() != val:
+                    match = False
+                    break
+        if match:
+            filtered.append(record)
 
-    if response.status_code != 200:
-        return JSONResponse(
-            status_code=response.status_code,
-            content={"error": "Failed to fetch from Airtable", "details": response.text},
-        )
-
-    data = response.json()
     return {
         "source": matched_key,
-        "records": data.get("records", []),
-        "offset": data.get("offset"),
+        "records": filtered,
+        "offset": None
     }
