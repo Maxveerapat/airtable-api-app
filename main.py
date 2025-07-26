@@ -3,7 +3,7 @@ import json
 import difflib
 from typing import Optional, Dict, Any
 import requests
-from fastapi import FastAPI, Query, Path
+from fastapi import FastAPI, Request, Query, Path
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -29,7 +29,7 @@ def get_closest_source_key(requested_key: str, valid_keys: list) -> Optional[str
     matches = difflib.get_close_matches(requested_key.lower(), valid_keys, n=1, cutoff=0.8)
     return matches[0] if matches else None
 
-# Helper: build Airtable filter formula from query params
+# Build Airtable formula
 def build_formula(filters: Dict[str, str]) -> Optional[str]:
     conditions = []
     for key, val in filters.items():
@@ -52,11 +52,12 @@ def build_formula(filters: Dict[str, str]) -> Optional[str]:
             conditions.append(f"{{{key}}} = '{val}'")
     return f"AND({','.join(conditions)})" if conditions else None
 
+# Main route — read filters dynamically from raw request
 @app.get("/qu/{source}")
-def query_airtable(
+async def query_airtable(
+    request: Request,
     source: str = Path(..., description="The source name from bases.json"),
-    offset: Optional[str] = Query(None),
-    **query_params: str
+    offset: Optional[str] = Query(None)
 ):
     valid_keys = list(BASES.keys())
     matched_key = get_closest_source_key(source, valid_keys)
@@ -69,7 +70,11 @@ def query_airtable(
     base_id = BASES[matched_key]["base_id"]
     table_name = BASES[matched_key]["table"]
 
-    formula = build_formula(query_params)
+    # Parse filters from raw query
+    raw_query: Dict[str, Any] = dict(request.query_params)
+    raw_query.pop("offset", None)
+
+    formula = build_formula(raw_query)
     headers = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
     params = {"filterByFormula": formula} if formula else {}
     if offset:
