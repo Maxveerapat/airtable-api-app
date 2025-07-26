@@ -1,8 +1,9 @@
 import os
 import json
 import difflib
+from typing import Dict
 import requests
-from fastapi import FastAPI, Request, HTTPException, Path, Query
+from fastapi import FastAPI, HTTPException, Query, Path
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -11,6 +12,7 @@ AIRTABLE_URL = "https://api.airtable.com/v0"
 
 app = FastAPI()
 
+# CORS for Render + Custom GPT access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,19 +20,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Load base mappings
 with open("bases.json", "r") as f:
     BASES = json.load(f)
 
+# Match user input to closest base
 def get_closest_source_key(requested_key: str, valid_keys: list) -> str:
     matches = difflib.get_close_matches(requested_key.lower(), valid_keys, n=1, cutoff=0.8)
     return matches[0] if matches else None
 
+# Main route for Airtable query
 @app.get("/qu/{source}")
-async def query_airtable(
-    request: Request,
-    source: str = Path(...),
-    offset: str = Query(None)
+def query_airtable(
+    source: str = Path(..., description="The source name from bases.json"),
+    offset: str = Query(None),
+    **query_params: str
 ):
+    # Match source
     valid_keys = list(BASES.keys())
     matched_key = get_closest_source_key(source, valid_keys)
     if not matched_key:
@@ -42,28 +48,26 @@ async def query_airtable(
     base_id = BASES[matched_key]["base_id"]
     table_name = BASES[matched_key]["table"]
 
-    query_params = dict(request.query_params)
-    query_params.pop("offset", None)
-
+    # Convert query params into Airtable formula
     conditions = []
     for key, val in query_params.items():
         if key.endswith("_lte"):
             field = key[:-4]
-            conditions.append(f"{{{field}}} <= {val}")
+            conditions.append(f"AND(NOT({{{field}}} = BLANK()), {{{field}}} <= {val})")
         elif key.endswith("_gte"):
             field = key[:-4]
-            conditions.append(f"{{{field}}} >= {val}")
+            conditions.append(f"AND(NOT({{{field}}} = BLANK()), {{{field}}} >= {val})")
         elif key.endswith("_lt"):
             field = key[:-3]
-            conditions.append(f"{{{field}}} < {val}")
+            conditions.append(f"AND(NOT({{{field}}} = BLANK()), {{{field}}} < {val})")
         elif key.endswith("_gt"):
             field = key[:-3]
-            conditions.append(f"{{{field}}} > {val}")
+            conditions.append(f"AND(NOT({{{field}}} = BLANK()), {{{field}}} > {val})")
         elif key.endswith("_ne"):
             field = key[:-3]
-            conditions.append(f"NOT({{{field}}} = '{val}')")
+            conditions.append(f"AND(NOT({{{field}}} = BLANK()), NOT({{{field}}} = '{val}'))")
         else:
-            conditions.append(f"{{{key}}} = '{val}'")
+            conditions.append(f"AND(NOT({{{key}}} = BLANK()), {{{key}}} = '{val}')")
 
     formula = f"AND({','.join(conditions)})" if conditions else None
 
